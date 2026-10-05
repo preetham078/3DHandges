@@ -1,6 +1,8 @@
 # HandTracking3D
 
 A browser-based AI hand control experience built with MediaPipe Hand Landmarker and Three.js. It renders a futuristic digital humanoid, tracks a live webcam hand, and responds to gestures with interactive motion, pulse effects, and a clean cinematic HUD.
+**
+Website is live here :** https://preetham078.github.io/3DHandges/
 
 ## Features
 
