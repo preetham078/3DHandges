@@ -36,32 +36,19 @@ const ui = {
   footerStatus: document.querySelector("#footer-status"),
 };
 
-const gestureIcons = {
-  "OPEN PALM": "✋",
-  PINCH: "🤏",
-  FIST: "✊",
-  "THUMBS UP": "👍",
-  "TWO FINGERS": "✌",
-  "NO HAND": "◎",
-  UNKNOWN: "◎",
-};
-
 const state = {
   stream: null,
   active: false,
   cameraEnabled: false,
+  poseLandmarker: null,
   handLandmarker: null,
-  handLandmarkerReady: false,
+  faceLandmarker: null,
+  motionTrackingReady: false,
   renderer: null,
   scene: null,
   camera: null,
   robot: null,
-  robotTargetMeshes: {},
-  robotSelection: null,
   robotModules: {},
-  robotPickables: [],
-  selectedModule: null,
-  allExploded: false,
   cameraYaw: 0,
   cameraPitch: 0.04,
   cameraRadius: 12.4,
@@ -71,23 +58,14 @@ const state = {
   pointerDown: false,
   pointerX: 0,
   pointerY: 0,
-  didDrag: false,
   animationStarted: false,
-  interactionActive: false,
-  objectSelected: false,
-  precisionMode: false,
-  tapPulse: 0,
-  confirmPulse: 0,
-  lastGesture: "NO HAND",
+  motionActive: false,
   lastVideoTime: -1,
   lastFrameTime: performance.now(),
   frameCount: 0,
   lastFpsUpdate: performance.now(),
-  smoothedLandmarks: null,
-  currentGesture: "NO HAND",
-  candidateGesture: "",
-  candidateFrames: 0,
-  lastHands: [],
+  smoothedLandmarks: {},
+  lastPose: null,
 };
 
 const HAND_CONNECTIONS = [
@@ -150,8 +128,8 @@ function canvasPoint(landmark) {
   };
 }
 
-function drawLandmarks(hands) {
-  clearLandmarks();
+function drawLandmarks(hands, shouldClear = true) {
+  if (shouldClear) clearLandmarks();
   if (!hands.length) return;
   hands.forEach((hand) => {
     const points = hand.map(canvasPoint);
@@ -188,78 +166,69 @@ function drawLandmarks(hands) {
   });
 }
 
+const POSE_CONNECTIONS = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 25], [25, 27], [24, 26], [26, 28], [27, 31], [28, 32]];
+
+function drawPoseOverlay(pose, hands) {
+  clearLandmarks();
+  if (pose) {
+    const points = pose.map(canvasPoint);
+    landmarkContext.save();
+    landmarkContext.lineCap = "round";
+    POSE_CONNECTIONS.forEach(([fromIndex, toIndex]) => {
+      const from = points[fromIndex]; const to = points[toIndex];
+      landmarkContext.beginPath(); landmarkContext.moveTo(from.x, from.y); landmarkContext.lineTo(to.x, to.y);
+      landmarkContext.strokeStyle = "#61f1df"; landmarkContext.lineWidth = 2.2; landmarkContext.shadowColor = "#3df9e8"; landmarkContext.shadowBlur = 9; landmarkContext.stroke();
+    });
+    [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28].forEach((index) => {
+      const point = points[index]; landmarkContext.beginPath(); landmarkContext.arc(point.x, point.y, index === 0 ? 5 : 3.4, 0, Math.PI * 2);
+      landmarkContext.fillStyle = "#eaffff"; landmarkContext.fill();
+    });
+    landmarkContext.restore();
+  }
+  drawLandmarks(hands, false);
+}
+
 function distance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
 }
 
-function isFingerExtended(landmarks, tip, pip, mcp) {
-  return landmarks[tip].y < landmarks[pip].y && distance(landmarks[tip], landmarks[0]) > distance(landmarks[pip], landmarks[0]) * 1.08 &&
-    distance(landmarks[tip], landmarks[0]) > distance(landmarks[mcp], landmarks[0]) * 1.22;
-}
-
-function classifyGesture(landmarks) {
-  const palmWidth = Math.max(distance(landmarks[5], landmarks[17]), 0.001);
-  const thumbIndexGap = distance(landmarks[4], landmarks[8]) / palmWidth;
-  const index = isFingerExtended(landmarks, 8, 6, 5);
-  const middle = isFingerExtended(landmarks, 12, 10, 9);
-  const ring = isFingerExtended(landmarks, 16, 14, 13);
-  const pinky = isFingerExtended(landmarks, 20, 18, 17);
-  const thumbExtended = distance(landmarks[4], landmarks[5]) > distance(landmarks[3], landmarks[5]) * 1.28;
-  const extendedCount = [index, middle, ring, pinky].filter(Boolean).length;
-  const otherFingersFolded = extendedCount <= 1;
-
-  if (thumbExtended && otherFingersFolded && landmarks[4].y < landmarks[3].y - palmWidth * 0.16 && landmarks[4].y < landmarks[2].y) {
-    return { name: "THUMBS UP", confidence: 0.91 };
+function smoothHand(landmarks, key) {
+  const alpha = 0.36;
+  const previous = state.smoothedHands[key];
+  if (!previous || previous.length !== landmarks.length) {
+    state.smoothedHands[key] = landmarks.map((point) => ({ ...point }));
+    return state.smoothedHands[key];
   }
-  if (thumbIndexGap < 0.36) return { name: "PINCH", confidence: Math.min(0.99, 0.74 + (0.36 - thumbIndexGap) * 0.6) };
-  if (extendedCount === 4) return { name: "OPEN PALM", confidence: 0.92 };
-  if (index && middle && !ring && !pinky) return { name: "TWO FINGERS", confidence: 0.88 };
-  if (extendedCount === 0) return { name: "FIST", confidence: 0.86 };
-  return { name: "UNKNOWN", confidence: 0.58 };
-}
-
-function smoothGesture(rawName) {
-  if (rawName === state.candidateGesture) {
-    state.candidateFrames += 1;
-  } else {
-    state.candidateGesture = rawName;
-    state.candidateFrames = 1;
-  }
-  if (state.candidateFrames >= 3) {
-    state.currentGesture = state.candidateGesture;
-  }
-}
-
-function smoothHand(landmarks) {
-  const alpha = 0.42;
-  if (!state.smoothedLandmarks || state.smoothedLandmarks.length !== landmarks.length) {
-    state.smoothedLandmarks = landmarks.map((point) => ({ ...point }));
-    return state.smoothedLandmarks;
-  }
-  state.smoothedLandmarks = landmarks.map((point, index) => ({
-    x: state.smoothedLandmarks[index].x + (point.x - state.smoothedLandmarks[index].x) * alpha,
-    y: state.smoothedLandmarks[index].y + (point.y - state.smoothedLandmarks[index].y) * alpha,
-    z: (state.smoothedLandmarks[index].z || 0) + ((point.z || 0) - (state.smoothedLandmarks[index].z || 0)) * alpha,
+  state.smoothedHands[key] = landmarks.map((point, index) => ({
+    x: previous[index].x + (point.x - previous[index].x) * alpha,
+    y: previous[index].y + (point.y - previous[index].y) * alpha,
+    z: (previous[index].z || 0) + ((point.z || 0) - (previous[index].z || 0)) * alpha,
   }));
-  return state.smoothedLandmarks;
+  return state.smoothedHands[key];
 }
 
-function updateGestureUi(gesture, confidence, landmarks) {
-  ui.gestureName.textContent = gesture;
-  ui.gestureCardName.textContent = gesture === "NO HAND" ? "AWAITING INPUT" : gesture;
-  ui.gestureIcon.textContent = gestureIcons[gesture] || "◎";
-  ui.confidence.textContent = gesture === "NO HAND" ? "—" : `${Math.round(confidence * 100)}%`;
-  ui.confidenceBar.style.width = gesture === "NO HAND" ? "0%" : `${Math.round(confidence * 100)}%`;
-  ui.handStatus.textContent = gesture === "NO HAND" ? "NOT DETECTED" : "DETECTED";
-  ui.handIcon.textContent = gesture === "NO HAND" ? "○" : "◉";
-  ui.handIcon.closest(".tracking-state").classList.toggle("active", gesture !== "NO HAND");
+function makeHandData(landmarks, key) {
+  const pinchPoint = {
+    x: (landmarks[4].x + landmarks[8].x) / 2,
+    y: (landmarks[4].y + landmarks[8].y) / 2,
+    z: (landmarks[4].z + landmarks[8].z) / 2,
+  };
+  const palmWidth = Math.max(distance(landmarks[5], landmarks[17]), 0.001);
+  return { key, landmarks, pinchPoint, pinching: distance(landmarks[4], landmarks[8]) / palmWidth < 0.43, depth: landmarks[9].z || 0 };
+}
 
-  if (landmarks?.length) {
-    const palm = landmarks[9];
-    ui.coordinates.textContent = `X ${(1 - palm.x).toFixed(2)}  Y ${palm.y.toFixed(2)}`;
-  } else {
-    ui.coordinates.textContent = "X --.--  Y --.--";
-  }
+function updateHandUi(right, left) {
+  const activeCount = Number(Boolean(right)) + Number(Boolean(left));
+  ui.gestureName.textContent = activeCount === 2 ? "TWO HANDS" : activeCount === 1 ? `${right ? "RIGHT" : "LEFT"} HAND` : "WAITING";
+  ui.handStatus.textContent = activeCount ? `${activeCount} HAND${activeCount > 1 ? "S" : ""} DETECTED` : "NOT DETECTED";
+  ui.handIcon.textContent = activeCount ? "◉" : "○";
+  ui.handIcon.closest(".tracking-state").classList.toggle("active", Boolean(activeCount));
+  ui.confidence.textContent = activeCount ? `${activeCount}/2` : "—";
+  ui.confidenceBar.style.width = `${activeCount * 50}%`;
+  if (right || left) {
+    const point = (right || left).pinchPoint;
+    ui.coordinates.textContent = `X ${(1 - point.x).toFixed(2)}  Y ${point.y.toFixed(2)}`;
+  } else ui.coordinates.textContent = "X --.--  Y --.--";
 }
 
 function setModuleExploded(key, exploded) {
@@ -269,7 +238,15 @@ function setModuleExploded(key, exploded) {
 
 function resetRobot() {
   state.allExploded = false;
-  Object.keys(state.robotModules).forEach((key) => setModuleExploded(key, false));
+  Object.keys(state.robotModules).forEach((key) => {
+    const module = state.robotModules[key];
+    setModuleExploded(key, false);
+    module.userData.manualActive = false;
+    module.userData.detached = false;
+    module.userData.manualRotation = new THREE.Euler();
+    if (module.userData.highlight) module.userData.highlight.visible = false;
+  });
+  state.heldModule = null;
   state.selectedModule = null;
   state.robotSelection = null;
   state.cameraFocusTarget.set(0, 0.15, 0);
@@ -299,35 +276,239 @@ function selectModule(key, explode = true) {
   ui.interactionState.textContent = "OBJECT SELECTED";
 }
 
-function updateInteraction(gesture, landmarks) {
-  if (!landmarks || !state.robot) {
-    if (!state.active) ui.interactionState.textContent = "MOUSE / TOUCH READY";
-    state.lastGesture = gesture;
-    return;
+function cursorWorld(point, zOffset = 0) {
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(new THREE.Vector2((1 - point.x) * 2 - 1, -(point.y * 2 - 1)), state.camera);
+  const normal = state.camera.getWorldDirection(new THREE.Vector3());
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, state.cameraFocus);
+  const world = raycaster.ray.intersectPlane(plane, new THREE.Vector3()) || state.cameraFocus.clone();
+  return world.addScaledVector(normal, zOffset);
+}
+
+function moduleAtHand(hand) {
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(new THREE.Vector2((1 - hand.pinchPoint.x) * 2 - 1, -(hand.pinchPoint.y * 2 - 1)), state.camera);
+  return raycaster.intersectObjects(state.robotPickables, false)[0];
+}
+
+function setModuleHighlight(key, visible) {
+  const module = state.robotModules[key];
+  if (!module || !state.scene) return;
+  if (!module.userData.highlight) {
+    module.userData.highlight = new THREE.BoxHelper(module, 0x62f0df);
+    module.userData.highlight.material.transparent = true;
+    module.userData.highlight.material.opacity = .78;
+    state.scene.add(module.userData.highlight);
   }
-  if (gesture === "OPEN PALM") {
-    state.interactionActive = true;
-    ui.confirmState.textContent = "AWAITING INPUT";
+  module.userData.highlight.visible = visible;
+}
+
+function beginGrab(key, hand, source = "RIGHT HAND") {
+  const module = state.robotModules[key];
+  if (!module || state.heldModule) return;
+  state.heldModule = key;
+  state.selectedModule = key;
+  state.robotSelection = key;
+  module.userData.manualActive = true;
+  module.userData.detached = true;
+  module.userData.targetExplode = 0;
+  const handLocal = state.robot.worldToLocal(cursorWorld(hand.pinchPoint, hand.depth * 2.6));
+  module.userData.grabOffset = module.position.clone().sub(handLocal);
+  module.userData.manualTarget = module.position.clone();
+  module.userData.manualRotation = module.rotation.clone();
+  setModuleHighlight(key, true);
+  state.cameraFocusTarget.copy(module.getWorldPosition(new THREE.Vector3()));
+  state.cameraRadiusTarget = Math.min(state.cameraRadiusTarget, module.userData.focusRadius || 6.4);
+  ui.objectHudLabel.textContent = `GRABBED — ${source}`;
+  ui.objectHud.classList.add("visible");
+  ui.interactionState.textContent = "HOLDING MODULE";
+  ui.confirmState.textContent = "DETACHED / INSPECT";
+}
+
+function releaseGrab(snap = false) {
+  const key = state.heldModule;
+  if (!key) return;
+  const module = state.robotModules[key];
+  if (snap) {
+    module.userData.manualTarget = module.userData.base.clone();
+    module.userData.manualRotation = new THREE.Euler();
+    module.userData.detached = false;
+    ui.objectHudLabel.textContent = "MODULE ATTACHED";
+    ui.confirmState.textContent = "MODULE ATTACHED";
+  } else {
+    ui.objectHudLabel.textContent = "MODULE RELEASED";
+    ui.confirmState.textContent = "FLOATING / GRAB TO MOVE";
   }
-  const handCenter = landmarks[9];
-  if (state.interactionActive) {
-    state.cameraYaw += ((0.5 - handCenter.x) * 1.25 - state.cameraYaw) * 0.08;
-    state.cameraPitch += ((0.5 - handCenter.y) * 0.48 - state.cameraPitch) * 0.08;
+  module.userData.manualActive = !snap;
+  setModuleHighlight(key, false);
+  state.heldModule = null;
+  state.leftInspectAnchor = null;
+  state.twoHandZoomAnchor = null;
+  state.snapFrames = 0;
+  ui.interactionState.textContent = snap ? "ATTACHED" : "MODULE RELEASED";
+}
+
+function updateHeldModule(right, left) {
+  const module = state.robotModules[state.heldModule];
+  if (!module) return;
+  const handLocal = state.robot.worldToLocal(cursorWorld(right.pinchPoint, right.depth * 2.6));
+  module.userData.manualTarget = handLocal.add(module.userData.grabOffset || new THREE.Vector3());
+  state.cameraFocusTarget.lerp(module.getWorldPosition(new THREE.Vector3()), .12);
+  if (left) {
+    if (!state.leftInspectAnchor) state.leftInspectAnchor = { x: left.pinchPoint.x, y: left.pinchPoint.y, depth: left.depth, rotation: module.userData.manualRotation.clone(), radius: state.cameraRadiusTarget };
+    const anchor = state.leftInspectAnchor;
+    module.userData.manualRotation.y = anchor.rotation.y + (left.pinchPoint.x - anchor.x) * 5;
+    module.userData.manualRotation.x = anchor.rotation.x + (left.pinchPoint.y - anchor.y) * 3;
+    state.cameraRadiusTarget = THREE.MathUtils.clamp(anchor.radius + (left.depth - anchor.depth) * 18, 3.8, 9);
+    ui.objectHudLabel.textContent = "INSPECTING — LEFT HAND";
+    ui.interactionState.textContent = "INSPECTING MODULE";
   }
-  if (gesture === "PINCH" && state.lastGesture !== "PINCH" && state.interactionActive) {
-    const raycaster = new THREE.Raycaster();
-    raycaster.setFromCamera(new THREE.Vector2(handCenter.x * 2 - 1, -(handCenter.y * 2 - 1)), state.camera);
-    const hit = raycaster.intersectObjects(state.robotPickables, false)[0];
-    if (hit) selectModule(hit.object.userData.partKey, true);
+  if (left?.pinching && right.pinching) {
+    const distanceNow = Math.hypot(left.pinchPoint.x - right.pinchPoint.x, left.pinchPoint.y - right.pinchPoint.y);
+    if (!state.twoHandZoomAnchor) state.twoHandZoomAnchor = { distance: distanceNow, radius: state.cameraRadiusTarget };
+    state.cameraRadiusTarget = THREE.MathUtils.clamp(state.twoHandZoomAnchor.radius - (distanceNow - state.twoHandZoomAnchor.distance) * 12, 3.6, 9);
+  } else state.twoHandZoomAnchor = null;
+  const snapDistance = module.userData.manualTarget.distanceTo(module.userData.base);
+  if (snapDistance < .42) {
+    state.snapFrames += 1;
+    ui.objectHudLabel.textContent = "READY TO ATTACH";
+    ui.confirmState.textContent = "ATTACH";
+    if (state.snapFrames > 12) releaseGrab(true);
+  } else state.snapFrames = 0;
+}
+
+function updateHandCursors(right, left) {
+  if (!state.handCursors) return;
+  [["right", right], ["left", left]].forEach(([key, hand]) => {
+    const cursor = state.handCursors[key];
+    cursor.visible = Boolean(hand);
+    if (!hand) return;
+    cursor.position.lerp(cursorWorld(hand.pinchPoint, hand.depth * 2.6), .35);
+    cursor.children[0].material.emissiveIntensity = hand.pinching ? 3.5 : 1.1;
+    cursor.scale.setScalar(hand.pinching ? 1.25 : 1);
+  });
+}
+
+function updateInteraction(right, left) {
+  state.rightHand = right; state.leftHand = left;
+  state.rightPinching = Boolean(right?.pinching); state.leftPinching = Boolean(left?.pinching);
+  updateHandUi(right, left); updateHandCursors(right, left);
+  if (right?.pinching && !state.lastRightPinching && !state.heldModule) {
+    const hit = moduleAtHand(right);
+    if (hit) beginGrab(hit.object.userData.partKey, right);
   }
-  if (gesture === "FIST" && state.lastGesture !== "FIST" && state.selectedModule) setModuleExploded(state.selectedModule, true);
-  if (gesture === "THUMBS UP" && state.lastGesture !== "THUMBS UP") {
-    state.confirmPulse = 1;
-    ui.confirmState.textContent = "CONFIRMED / RESET";
-    resetRobot();
+  if (state.heldModule && right?.pinching) updateHeldModule(right, left);
+  if (state.heldModule && (!right || !right.pinching)) releaseGrab(false);
+  if (!state.heldModule && !right && !left) {
+    ui.gestureCardName.textContent = "AWAITING HANDS";
+    ui.gestureIcon.textContent = "◎";
+  } else if (state.heldModule) {
+    ui.gestureCardName.textContent = left ? "TWO-HAND INSPECTION" : "RIGHT HAND HOLD";
+    ui.gestureIcon.textContent = "◉";
+  } else {
+    ui.gestureCardName.textContent = right?.pinching ? "SEARCHING MODULE" : "TRACKING HANDS";
+    ui.gestureIcon.textContent = "◌";
   }
-  ui.interactionState.textContent = state.interactionActive ? "GESTURE CONTROL" : "LOCKED";
-  state.lastGesture = gesture;
+  state.lastRightPinching = Boolean(right?.pinching);
+}
+
+function smoothLandmarkSet(landmarks, key) {
+  if (!landmarks?.length) return null;
+  const previous = state.smoothedLandmarks[key];
+  const amount = .32;
+  state.smoothedLandmarks[key] = !previous || previous.length !== landmarks.length ? landmarks.map((point) => ({ ...point })) : landmarks.map((point, index) => ({
+    x: previous[index].x + (point.x - previous[index].x) * amount,
+    y: previous[index].y + (point.y - previous[index].y) * amount,
+    z: (previous[index].z || 0) + ((point.z || 0) - (previous[index].z || 0)) * amount,
+  }));
+  return state.smoothedLandmarks[key];
+}
+
+function jointAngle(a, b, c) {
+  const ab = new THREE.Vector2(a.x - b.x, a.y - b.y);
+  const cb = new THREE.Vector2(c.x - b.x, c.y - b.y);
+  return Math.acos(THREE.MathUtils.clamp(ab.normalize().dot(cb.normalize()), -1, 1));
+}
+
+function limbDirection(a, b) {
+  return Math.atan2(b.y - a.y, b.x - a.x);
+}
+
+function poseRotation(key, x = 0, y = 0, z = 0) {
+  const part = state.robotModules[key];
+  if (part) part.userData.poseRotation = new THREE.Euler(x, y, z);
+}
+
+function updateMotionUi(pose) {
+  const detected = Boolean(pose);
+  ui.gestureName.textContent = detected ? "PERSON DETECTED" : "WAITING";
+  ui.handStatus.textContent = detected ? "BODY DETECTED" : "NOT DETECTED";
+  ui.handIcon.textContent = detected ? "◉" : "○";
+  ui.handIcon.closest(".tracking-state").classList.toggle("active", detected);
+  ui.confidence.textContent = detected ? "LIVE" : "—";
+  ui.confidenceBar.style.width = detected ? "100%" : "0%";
+  ui.gestureCardName.textContent = detected ? "MIRRORING MOTION" : "AWAITING SUBJECT";
+  ui.gestureIcon.textContent = detected ? "◉" : "◎";
+  ui.interactionState.textContent = detected ? "MIRROR ACTIVE" : "MIRROR READY";
+  ui.confirmState.textContent = detected ? "JOINT ANGLES MAPPED" : "AWAITING POSE";
+  ui.objectHudLabel.textContent = detected ? "LIVE HUMAN → ROBOT MIRROR" : "MIRROR MODE READY";
+  ui.objectHud.classList.toggle("visible", detected);
+}
+
+function applyHumanMotion(pose, hands, face) {
+  if (!pose) return;
+  const leftShoulder = pose[11], rightShoulder = pose[12], leftHip = pose[23], rightHip = pose[24];
+  const shoulderMid = { x: (leftShoulder.x + rightShoulder.x) / 2, y: (leftShoulder.y + rightShoulder.y) / 2, z: (leftShoulder.z + rightShoulder.z) / 2 };
+  const hipMid = { x: (leftHip.x + rightHip.x) / 2, y: (leftHip.y + rightHip.y) / 2, z: (leftHip.z + rightHip.z) / 2 };
+  const torsoLean = THREE.MathUtils.clamp(Math.atan2(shoulderMid.x - hipMid.x, hipMid.y - shoulderMid.y), -.45, .45);
+  const torsoYaw = THREE.MathUtils.clamp((leftShoulder.z - rightShoulder.z) * 2.8, -.45, .45);
+  poseRotation("TORSO", 0, torsoYaw, -torsoLean);
+  poseRotation("ABDOMEN", 0, torsoYaw * .7, -torsoLean * .7);
+  poseRotation("PELVIS", 0, torsoYaw * .35, -torsoLean * .35);
+
+  [["LEFT", 11, 13, 15, -1], ["RIGHT", 12, 14, 16, 1]].forEach(([side, shoulderIndex, elbowIndex, wristIndex, direction]) => {
+    const shoulder = pose[shoulderIndex], elbow = pose[elbowIndex], wrist = pose[wristIndex];
+    const directionAngle = limbDirection(shoulder, elbow);
+    const shoulderLift = THREE.MathUtils.clamp((directionAngle - Math.PI / 2) * direction, -1.55, 1.55);
+    const elbowBend = THREE.MathUtils.clamp(Math.PI - jointAngle(shoulder, elbow, wrist), 0, 2.1);
+    poseRotation(`${side}_ARM`, 0, (elbow.z - shoulder.z) * 1.9, shoulderLift);
+    const arm = state.robotModules[`${side}_ARM`];
+    if (arm?.userData.kinematics) {
+      arm.userData.kinematics.forearm.rotation.z += ((direction * elbowBend * .58) - arm.userData.kinematics.forearm.rotation.z) * .14;
+      arm.userData.kinematics.wrist.rotation.y += ((wrist.z - elbow.z) * 3 - arm.userData.kinematics.wrist.rotation.y) * .14;
+    }
+  });
+
+  [["LEFT", 23, 25, 27, -1], ["RIGHT", 24, 26, 28, 1]].forEach(([side, hipIndex, kneeIndex, ankleIndex, direction]) => {
+    const hip = pose[hipIndex], knee = pose[kneeIndex], ankle = pose[ankleIndex];
+    const legLift = THREE.MathUtils.clamp((limbDirection(hip, knee) - Math.PI / 2) * direction, -.95, .95);
+    const kneeBend = THREE.MathUtils.clamp(Math.PI - jointAngle(hip, knee, ankle), 0, 1.9);
+    poseRotation(`${side}_LEG`, 0, (knee.z - hip.z) * 1.5, legLift);
+    const leg = state.robotModules[`${side}_LEG`];
+    if (leg?.userData.kinematics) leg.userData.kinematics.shin.rotation.z += ((direction * kneeBend * .42) - leg.userData.kinematics.shin.rotation.z) * .14;
+    poseRotation(`${side}_FOOT`, (ankle.y - knee.y) * .6, 0, legLift * .25);
+  });
+
+  const head = state.robotModules.HEAD;
+  const neck = state.robotModules.NECK;
+  const headRoll = face?.length ? Math.atan2(face[263].y - face[33].y, face[263].x - face[33].x) : 0;
+  const headYaw = face?.length ? THREE.MathUtils.clamp((face[263].z - face[33].z) * 8, -.8, .8) : torsoYaw * .45;
+  const eyeMidY = face?.length ? (face[33].y + face[263].y) / 2 : pose[0].y;
+  const headPitch = face?.length ? THREE.MathUtils.clamp((face[1].y - eyeMidY) * 4, -.55, .55) : 0;
+  if (head) head.userData.poseRotation = new THREE.Euler(headPitch, headYaw, headRoll);
+  if (neck) neck.userData.poseRotation = new THREE.Euler(headPitch * .35, headYaw * .35, headRoll * .35);
+
+  hands.forEach(({ key, landmarks }) => {
+    const robotHand = state.robotModules[key === "Left" ? "LEFT_HAND" : "RIGHT_HAND"];
+    if (!robotHand?.userData.kinematics) return;
+    const fingerTips = [8, 12, 16, 20];
+    robotHand.userData.kinematics.fingers.forEach((finger, index) => {
+      const curl = THREE.MathUtils.clamp(1 - distance(landmarks[0], landmarks[fingerTips[index]]) / Math.max(distance(landmarks[0], landmarks[9]) * 2.1, .001), 0, 1);
+      finger.rotation.x += (curl * 1.15 - finger.rotation.x) * .14;
+    });
+    const thumbCurl = THREE.MathUtils.clamp(1 - distance(landmarks[0], landmarks[4]) / Math.max(distance(landmarks[0], landmarks[9]) * 1.55, .001), 0, 1);
+    robotHand.userData.kinematics.thumb.rotation.x += (thumbCurl * .8 - robotHand.userData.kinematics.thumb.rotation.x) * .14;
+  });
 }
 
 function createHumanoidRobot() {
@@ -396,6 +577,7 @@ function createHumanoidRobot() {
     const elbow = joint(.19, .29); elbow.position.set(side * .27, -1.12, 0); group.add(elbow);
     const forearm = limbHousing(.78, .18, side); forearm.position.set(side * .32, -1.64, 0); group.add(forearm);
     const wrist = joint(.12, .2); wrist.position.set(side * .3, -2.1, 0); group.add(wrist);
+    group.userData.kinematics = { upper, elbow, forearm, wrist };
     return group;
   };
   const handModule = (side) => {
@@ -403,8 +585,10 @@ function createHumanoidRobot() {
     group.add(box(.34, .42, .2, shellLight, new THREE.Vector3(0, 0, .02)));
     group.add(box(.22, .28, .1, carbon, new THREE.Vector3(0, -.02, .14)));
     const fingerX = [-.13, -.045, .045, .13];
+    const fingers = [];
     fingerX.forEach((finger, index) => {
       const digit = new THREE.Group(); digit.position.set(finger, -.27, .02); group.add(digit);
+      fingers.push(digit);
       for (let segment = 0; segment < 3; segment += 1) {
         const length = segment === 0 ? .17 : .125;
         const phalanx = box(.052, length, .062, shell, new THREE.Vector3(0, -segment * .135, 0));
@@ -415,6 +599,7 @@ function createHumanoidRobot() {
     });
     const thumb = new THREE.Group(); thumb.position.set(side * .22, -.08, 0); thumb.rotation.z = side * -.68; group.add(thumb);
     thumb.add(box(.055, .19, .066, shell, new THREE.Vector3(0, -.08, 0))); thumb.add(box(.05, .14, .06, shellLight, new THREE.Vector3(0, -.23, 0)));
+    group.userData.kinematics = { fingers, thumb };
     return group;
   };
   const legModule = (side) => {
@@ -424,6 +609,7 @@ function createHumanoidRobot() {
     const knee = joint(.23, .32); knee.position.set(0, -1.27, .02); group.add(knee);
     const shin = limbHousing(1.02, .23, -side); shin.position.set(0, -1.91, 0); group.add(shin);
     const ankle = joint(.14, .25); ankle.position.set(0, -2.48, .02); group.add(ankle);
+    group.userData.kinematics = { thigh, knee, shin, ankle };
     return group;
   };
   const footModule = (side) => {
@@ -505,16 +691,26 @@ function initializeThree() {
   const robot = createHumanoidRobot();
   scene.add(robot);
 
+  const createHandCursor = (color) => {
+    const cursor = new THREE.Group();
+    const glow = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 1.1, metalness: .35, roughness: .24 });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(.115, .012, 8, 20), glow);
+    const dot = new THREE.Mesh(new THREE.SphereGeometry(.027, 10, 8), glow);
+    cursor.add(ring, dot);
+    cursor.visible = false;
+    scene.add(cursor);
+    return cursor;
+  };
+
   state.scene = scene;
   state.camera = camera;
   state.renderer = renderer;
   state.robot = robot;
   state.robotModules = robot.userData.modules;
-  state.robotPickables = robot.userData.pickables;
 
   resizeThree();
   ui.sceneLoading.hidden = true;
-  ui.interactionState.textContent = "MOUSE / TOUCH READY";
+  ui.interactionState.textContent = "MIRROR READY";
   if (!state.animationStarted) {
     state.animationStarted = true;
     requestAnimationFrame(animate);
@@ -535,9 +731,11 @@ function resizeThree() {
 function animateRobot(now) {
   if (!state.robot) return;
   Object.values(state.robotModules).forEach((part) => {
-    const { base, explode, targetExplode } = part.userData;
-    const desired = base.clone().addScaledVector(explode, targetExplode);
-    part.position.lerp(desired, 0.095);
+    const pose = part.userData.poseRotation || new THREE.Euler();
+    part.position.lerp(part.userData.base, 0.08);
+    part.rotation.x += (pose.x - part.rotation.x) * .12;
+    part.rotation.y += (pose.y - part.rotation.y) * .12;
+    part.rotation.z += (pose.z - part.rotation.z) * .12;
   });
 }
 
@@ -566,72 +764,74 @@ function animate() {
     state.cameraFocus.z + Math.cos(state.cameraYaw) * cosPitch * state.cameraRadius,
   );
   state.camera.lookAt(state.cameraFocus);
-  if (state.selectedModule) {
-    const selected = state.robotModules[state.selectedModule];
-    const marker = selected.getWorldPosition(new THREE.Vector3()).project(state.camera);
-    const width = sceneViewport.clientWidth; const height = sceneViewport.clientHeight;
-    ui.objectHud.style.left = `${(marker.x * .5 + .5) * width + 24}px`;
-    ui.objectHud.style.top = `${(-marker.y * .5 + .5) * height - 16}px`;
-  }
   if (state.renderer) state.renderer.render(state.scene, state.camera);
-  ui.sceneCoords.textContent = state.selectedModule ? `FOCUS ${state.selectedModule}` : "READY / SELECT MODULE";
+  ui.sceneCoords.textContent = state.motionActive ? "LIVE BODY → ROBOT" : "AWAITING BODY POSE";
 }
 
 async function initializeHandTracking() {
-  if (state.handLandmarkerReady) return;
+  if (state.motionTrackingReady) return;
   try {
     const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs");
     const fileset = await vision.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm");
-    state.handLandmarker = await vision.HandLandmarker.createFromOptions(fileset, {
+    state.poseLandmarker = await vision.PoseLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", delegate: "GPU" },
+      runningMode: "VIDEO", numPoses: 1, minPoseDetectionConfidence: .55, minPosePresenceConfidence: .5, minTrackingConfidence: .5,
+    });
+    state.motionTrackingReady = true;
+    // Hand and face details improve the mirror but never block the initial body pose.
+    vision.HandLandmarker.createFromOptions(fileset, {
       baseOptions: {
         modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
         delegate: "GPU",
       },
       runningMode: "VIDEO",
-      numHands: 1,
+      numHands: 2,
       minHandDetectionConfidence: 0.55,
       minHandPresenceConfidence: 0.5,
       minTrackingConfidence: 0.5,
-    });
-    state.handLandmarkerReady = true;
+    }).then((tracker) => { state.handLandmarker = tracker; }).catch((error) => console.warn("Hand detail tracking unavailable:", error));
+    vision.FaceLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+      runningMode: "VIDEO", numFaces: 1, minFaceDetectionConfidence: .5, minFacePresenceConfidence: .5, minTrackingConfidence: .5,
+    }).then((tracker) => { state.faceLandmarker = tracker; }).catch((error) => console.warn("Face detail tracking unavailable:", error));
   } catch (error) {
-    console.error("MediaPipe failed to initialize:", error);
-    throw new Error("mediapipe");
+    console.error("Motion tracking failed to initialize:", error);
+    throw new Error("motion-tracking");
   }
 }
 
 function processVideoFrame() {
-  if (!state.active || !state.cameraEnabled || !state.handLandmarker || !video) return;
+  if (!state.active || !state.cameraEnabled || !state.poseLandmarker || !video) return;
   try {
     if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.currentTime !== state.lastVideoTime) {
       state.lastVideoTime = video.currentTime;
-      const result = state.handLandmarker.detectForVideo(video, performance.now());
-      const landmarks = result.landmarks?.length ? result.landmarks.map(smoothHand) : [];
-      state.lastHands = landmarks;
-      drawLandmarks(landmarks);
-
-      if (landmarks.length) {
-        const classification = classifyGesture(landmarks[0]);
-        smoothGesture(classification.name);
-        updateGestureUi(state.currentGesture, classification.confidence, landmarks[0]);
-        updateInteraction(state.currentGesture, landmarks[0]);
+      const now = performance.now();
+      const poseResult = state.poseLandmarker.detectForVideo(video, now);
+      const handResult = state.handLandmarker?.detectForVideo(video, now) || { landmarks: [], handedness: [] };
+      const faceResult = state.faceLandmarker?.detectForVideo(video, now);
+      const pose = smoothLandmarkSet(poseResult.landmarks?.[0], "pose");
+      const hands = (handResult.landmarks || []).map((landmarks, index) => ({
+        key: handResult.handedness?.[index]?.[0]?.categoryName || "Right",
+        landmarks: smoothLandmarkSet(landmarks, `hand-${index}`),
+      }));
+      const face = smoothLandmarkSet(faceResult?.faceLandmarks?.[0], "face");
+      drawPoseOverlay(pose, hands.map((hand) => hand.landmarks));
+      updateMotionUi(pose);
+      state.motionActive = Boolean(pose);
+      if (pose) {
+        applyHumanMotion(pose, hands, face);
         ui.trackingStatus.textContent = "ACTIVE";
-        ui.handStatus.textContent = "DETECTED";
         ui.footerStatus.textContent = "ACTIVE";
       } else {
-        state.smoothedLandmarks = null;
-        smoothGesture("NO HAND");
-        updateGestureUi(state.currentGesture, 0, null);
-        updateInteraction(state.currentGesture, null);
         ui.trackingStatus.textContent = "STANDBY";
         ui.footerStatus.textContent = "ACTIVE";
       }
     }
   } catch (error) {
-    console.error("Hand tracking frame failed:", error);
+    console.error("Motion tracking frame failed:", error);
     ui.trackingStatus.textContent = "ERROR";
-    ui.footerStatus.textContent = "TRACKING ERROR";
-    setSceneError("Hand tracking encountered an error. Reload the page and try again.");
+    ui.footerStatus.textContent = "POSE TRACKING ERROR";
+    setSceneError("Body tracking encountered an error. Reload the page and try again.");
     stopCamera();
     return;
   }
@@ -666,20 +866,29 @@ async function startExperience() {
     cameraViewport.classList.add("is-live");
     await video.play();
 
-    if (!state.handLandmarkerReady) {
-      await initializeHandTracking();
-    }
-
     state.active = true;
     state.cameraEnabled = true;
     ui.cameraTag.textContent = "LIVE INPUT";
     ui.cameraState.textContent = "CAMERA LIVE";
     ui.trackingStatus.textContent = "ACTIVE";
     ui.footerStatus.textContent = "ACTIVE";
-    ui.handStatus.textContent = "NOT DETECTED";
+    ui.handStatus.textContent = "BODY NOT DETECTED";
     startScreen.classList.add("dismissed");
     updateCameraToggle();
-    requestAnimationFrame(processVideoFrame);
+    if (state.motionTrackingReady) {
+      requestAnimationFrame(processVideoFrame);
+    } else {
+      ui.trackingStatus.textContent = "LOADING POSE";
+      ui.footerStatus.textContent = "LOADING POSE MODEL";
+      initializeHandTracking().then(() => {
+        if (state.active) requestAnimationFrame(processVideoFrame);
+      }).catch((trackingError) => {
+        console.error("Motion tracker failed:", trackingError);
+        ui.trackingStatus.textContent = "UNAVAILABLE";
+        ui.footerStatus.textContent = "POSE MODEL UNAVAILABLE";
+        setSceneError("Camera is live, but the pose model could not load. Check your internet connection and reload.");
+      });
+    }
   } catch (error) {
     console.error("Experience initialization failed:", error);
     if (state.stream) {
@@ -714,13 +923,13 @@ function stopCamera() {
   clearLandmarks();
   ui.cameraTag.textContent = "CAMERA OFF";
   ui.cameraState.textContent = "CAMERA OFF";
-  ui.handStatus.textContent = "NOT DETECTED";
+  ui.handStatus.textContent = "BODY NOT DETECTED";
   ui.handIcon.textContent = "○";
   ui.handIcon.closest(".tracking-state").classList.remove("active");
   ui.trackingStatus.textContent = "OFFLINE";
   ui.footerStatus.textContent = "CAMERA OFF";
-  ui.gestureName.textContent = "—";
-  ui.gestureCardName.textContent = "AWAITING INPUT";
+  ui.gestureName.textContent = "WAITING";
+  ui.gestureCardName.textContent = "AWAITING SUBJECT";
   ui.gestureIcon.textContent = "◎";
   ui.confidence.textContent = "—";
   ui.confidenceBar.style.width = "0%";
@@ -739,34 +948,17 @@ cameraToggleButton.addEventListener("click", () => {
 startButton.addEventListener("click", startExperience);
 window.addEventListener("resize", resizeThree);
 
-document.querySelector("#exploded-view").addEventListener("click", explodeRobot);
-document.querySelector("#reset-robot").addEventListener("click", resetRobot);
-
-function pickRobotAt(clientX, clientY) {
-  if (!state.camera || !state.robotPickables.length) return;
-  const bounds = sceneViewport.getBoundingClientRect();
-  const point = new THREE.Vector2(((clientX - bounds.left) / bounds.width) * 2 - 1, -((clientY - bounds.top) / bounds.height) * 2 + 1);
-  const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(point, state.camera);
-  const hit = raycaster.intersectObjects(state.robotPickables, false)[0];
-  if (hit) selectModule(hit.object.userData.partKey, true);
-}
-
 sceneViewport.addEventListener("pointerdown", (event) => {
-  if (event.target.closest("button")) return;
-  state.pointerDown = true; state.didDrag = false; state.pointerX = event.clientX; state.pointerY = event.clientY;
+  state.pointerDown = true; state.pointerX = event.clientX; state.pointerY = event.clientY;
   sceneViewport.setPointerCapture?.(event.pointerId);
 });
 sceneViewport.addEventListener("pointermove", (event) => {
   if (!state.pointerDown) return;
   const dx = event.clientX - state.pointerX; const dy = event.clientY - state.pointerY;
-  if (Math.abs(dx) + Math.abs(dy) > 2) state.didDrag = true;
-  state.cameraYaw -= dx * .009;
-  state.cameraPitch += dy * .006;
+  state.cameraYaw -= dx * .009; state.cameraPitch += dy * .006;
   state.pointerX = event.clientX; state.pointerY = event.clientY;
 });
 sceneViewport.addEventListener("pointerup", (event) => {
-  if (state.pointerDown && !state.didDrag) pickRobotAt(event.clientX, event.clientY);
   state.pointerDown = false;
 });
 sceneViewport.addEventListener("wheel", (event) => {
