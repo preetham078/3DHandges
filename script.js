@@ -4,6 +4,7 @@ const video = document.querySelector("#camera");
 const landmarkCanvas = document.querySelector("#landmarks");
 const landmarkContext = landmarkCanvas.getContext("2d");
 const cameraViewport = document.querySelector("#camera-viewport");
+const sceneViewport = document.querySelector("#scene");
 const startScreen = document.querySelector("#start-screen");
 const startButton = document.querySelector("#start-button");
 const startError = document.querySelector("#start-error");
@@ -30,6 +31,7 @@ const ui = {
   sceneLoading: document.querySelector("#scene-loading"),
   sceneError: document.querySelector("#scene-error"),
   objectHud: document.querySelector("#object-hud"),
+  objectHudLabel: document.querySelector("#object-hud-label"),
   sceneCoords: document.querySelector("#scene-coords"),
   footerStatus: document.querySelector("#footer-status"),
 };
@@ -55,7 +57,22 @@ const state = {
   camera: null,
   robot: null,
   robotTargetMeshes: {},
-  robotSelection: "chest",
+  robotSelection: null,
+  robotModules: {},
+  robotPickables: [],
+  selectedModule: null,
+  allExploded: false,
+  cameraYaw: 0,
+  cameraPitch: 0.04,
+  cameraRadius: 12.4,
+  cameraFocus: new THREE.Vector3(0, 0.15, 0),
+  cameraFocusTarget: new THREE.Vector3(0, 0.15, 0),
+  cameraRadiusTarget: 12.4,
+  pointerDown: false,
+  pointerX: 0,
+  pointerY: 0,
+  didDrag: false,
+  animationStarted: false,
   interactionActive: false,
   objectSelected: false,
   precisionMode: false,
@@ -245,309 +262,228 @@ function updateGestureUi(gesture, confidence, landmarks) {
   }
 }
 
-function triggerBurst() {
-  if (!state.robot) return;
-  state.tapPulse = 1;
-  if (state.robot.userData.coreMaterial) {
-    state.robot.userData.coreMaterial.emissiveIntensity = 2.8;
-  }
+function setModuleExploded(key, exploded) {
+  const module = state.robotModules[key];
+  if (module) module.userData.targetExplode = exploded ? 1 : 0;
 }
 
-function highlightBodyPart(partName) {
-  const targets = Object.values(state.robotTargetMeshes);
-  targets.forEach((target) => {
-    const isSelected = target.userData.partName === partName;
-    const material = target.material;
-    material.opacity = isSelected ? 0.7 : 0.08;
-    material.color.set(isSelected ? 0x7ef0ff : 0x4dd0ff);
-  });
-  state.robotSelection = partName;
+function resetRobot() {
+  state.allExploded = false;
+  Object.keys(state.robotModules).forEach((key) => setModuleExploded(key, false));
+  state.selectedModule = null;
+  state.robotSelection = null;
+  state.cameraFocusTarget.set(0, 0.15, 0);
+  state.cameraRadiusTarget = 12.4;
+  ui.objectHud.classList.remove("visible");
+  ui.sceneTag.textContent = "INTERACTION IDLE";
+}
+
+function explodeRobot() {
+  state.allExploded = true;
+  Object.keys(state.robotModules).forEach((key) => setModuleExploded(key, true));
+  ui.sceneTag.textContent = "ARCHITECTURE EXPLODED";
+}
+
+function selectModule(key, explode = true) {
+  const module = state.robotModules[key];
+  if (!module) return;
+  if (state.selectedModule && state.selectedModule !== key && !state.allExploded) setModuleExploded(state.selectedModule, false);
+  state.selectedModule = key;
+  state.robotSelection = key;
+  if (explode) setModuleExploded(key, true);
+  module.getWorldPosition(state.cameraFocusTarget);
+  state.cameraRadiusTarget = Math.max(4.6, Math.min(8.4, module.userData.focusRadius || 6.6));
+  ui.objectHudLabel.textContent = module.userData.label;
+  ui.objectHud.classList.add("visible");
+  ui.sceneTag.textContent = module.userData.label;
+  ui.interactionState.textContent = "OBJECT SELECTED";
 }
 
 function updateInteraction(gesture, landmarks) {
   if (!landmarks || !state.robot) {
-    state.interactionActive = false;
-    state.objectSelected = false;
-    ui.interactionState.textContent = "LOCKED";
-    ui.sceneTag.textContent = "INTERACTION IDLE";
-    ui.objectHud.classList.remove("visible");
+    if (!state.active) ui.interactionState.textContent = "MOUSE / TOUCH READY";
     state.lastGesture = gesture;
     return;
   }
-
   if (gesture === "OPEN PALM") {
     state.interactionActive = true;
-    state.objectSelected = false;
     ui.confirmState.textContent = "AWAITING INPUT";
   }
-
-  if (gesture === "PINCH" && state.interactionActive) {
-    state.objectSelected = true;
+  const handCenter = landmarks[9];
+  if (state.interactionActive) {
+    state.cameraYaw += ((0.5 - handCenter.x) * 1.25 - state.cameraYaw) * 0.08;
+    state.cameraPitch += ((0.5 - handCenter.y) * 0.48 - state.cameraPitch) * 0.08;
   }
-
-  if (gesture === "FIST" && state.lastGesture !== "FIST") {
-    triggerBurst();
+  if (gesture === "PINCH" && state.lastGesture !== "PINCH" && state.interactionActive) {
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(new THREE.Vector2(handCenter.x * 2 - 1, -(handCenter.y * 2 - 1)), state.camera);
+    const hit = raycaster.intersectObjects(state.robotPickables, false)[0];
+    if (hit) selectModule(hit.object.userData.partKey, true);
   }
-
+  if (gesture === "FIST" && state.lastGesture !== "FIST" && state.selectedModule) setModuleExploded(state.selectedModule, true);
   if (gesture === "THUMBS UP" && state.lastGesture !== "THUMBS UP") {
     state.confirmPulse = 1;
-    ui.confirmState.textContent = "CONFIRMED";
+    ui.confirmState.textContent = "CONFIRMED / RESET";
+    resetRobot();
   }
-
-  if (gesture === "TWO FINGERS" && state.lastGesture !== "TWO FINGERS") {
-    state.precisionMode = !state.precisionMode;
-  }
-
-  if (gesture === "NO HAND") {
-    state.interactionActive = false;
-    state.objectSelected = false;
-  }
-
-  const handCenter = landmarks[9];
-  const targetX = (0.5 - handCenter.x) * 3.5;
-  const targetY = (0.5 - handCenter.y) * 1.6;
-  const targetYaw = (0.5 - handCenter.x) * 1.2;
-  const targetPitch = (0.5 - handCenter.y) * 0.7;
-  state.robot.position.x += (targetX - state.robot.position.x) * 0.12;
-  state.robot.position.y += (targetY - state.robot.position.y) * 0.12;
-  state.robot.rotation.y += (targetYaw - state.robot.rotation.y) * 0.1;
-  state.robot.rotation.x += (targetPitch - state.robot.rotation.x) * 0.1;
-
-  if (gesture === "PINCH" || gesture === "TWO FINGERS") {
-    const handX = handCenter.x * 2 - 1;
-    const handY = -(handCenter.y * 2 - 1);
-    const raycaster = new THREE.Raycaster();
-    raycaster.setFromCamera(new THREE.Vector2(handX, handY), state.camera);
-    const targetMeshes = Object.values(state.robotTargetMeshes);
-    const hits = raycaster.intersectObjects(targetMeshes, false);
-    if (hits.length) {
-      const part = hits[0].object.userData.partName;
-      highlightBodyPart(part);
-      ui.objectHud.classList.add("visible");
-    } else {
-      ui.objectHud.classList.remove("visible");
-    }
-  }
-
-  if (!state.interactionActive) {
-    ui.interactionState.textContent = "LOCKED";
-  } else if (state.objectSelected) {
-    ui.interactionState.textContent = state.precisionMode ? "PRECISION CONTROL" : "OBJECT SELECTED";
-  } else {
-    ui.interactionState.textContent = "ACTIVE / READY";
-  }
-
-  ui.sceneTag.textContent = state.objectSelected ? "OBJECT SELECTED" : state.interactionActive ? "INTERACTION ACTIVE" : "INTERACTION IDLE";
-  ui.objectHud.classList.toggle("visible", state.objectSelected);
-
+  ui.interactionState.textContent = state.interactionActive ? "GESTURE CONTROL" : "LOCKED";
   state.lastGesture = gesture;
-}
-
-function createRobotTarget(partName, color) {
-  const geometry = new THREE.SphereGeometry(0.22, 18, 14);
-  const material = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.08, depthWrite: false, blending: THREE.AdditiveBlending });
-  const mesh = new THREE.Mesh(geometry, material);
-  mesh.userData.partName = partName;
-  mesh.visible = true;
-  return mesh;
 }
 
 function createHumanoidRobot() {
   const root = new THREE.Group();
-  const robotColor = new THREE.Color(0x7ae8df);
-  const shellColor = new THREE.Color(0x8fc6ff);
-  const coreMaterial = new THREE.MeshStandardMaterial({
-    color: robotColor,
-    emissive: new THREE.Color(0x1d7c84),
-    emissiveIntensity: 1.2,
-    roughness: 0.3,
-    metalness: 0.55,
-    transparent: true,
-    opacity: 0.95,
-  });
+  root.name = "Robot";
+  const modules = {};
+  const pickables = [];
+  const shell = new THREE.MeshStandardMaterial({ color: 0xa8bbc8, metalness: 0.86, roughness: 0.27 });
+  const shellLight = new THREE.MeshStandardMaterial({ color: 0xe1e9ec, metalness: 0.78, roughness: 0.22 });
+  const carbon = new THREE.MeshStandardMaterial({ color: 0x14212a, metalness: 0.35, roughness: 0.36 });
+  const jointMat = new THREE.MeshStandardMaterial({ color: 0x33414c, metalness: 0.95, roughness: 0.2 });
+  const accent = new THREE.MeshStandardMaterial({ color: 0x167f9c, emissive: 0x07546a, emissiveIntensity: 1.15, metalness: 0.72, roughness: 0.2 });
+  const rubber = new THREE.MeshStandardMaterial({ color: 0x0b1116, roughness: 0.62, metalness: 0.15 });
+  const boltMat = new THREE.MeshStandardMaterial({ color: 0x75838b, metalness: 0.9, roughness: 0.24 });
 
-  const body = new THREE.Group();
-  root.add(body);
-
-  const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.7, 1.6, 10, 16), coreMaterial.clone());
-  torso.position.y = 1.2;
-  torso.rotation.z = 0.12;
-  body.add(torso);
-
-  const chestPlate = new THREE.Mesh(new THREE.BoxGeometry(1.15, 1.2, 0.72), new THREE.MeshBasicMaterial({
-    color: 0x9cf5ef,
-    transparent: true,
-    opacity: 0.18,
-    wireframe: true,
-  }));
-  chestPlate.position.set(0, 1.2, 0.14);
-  body.add(chestPlate);
-
-  const pelvis = new THREE.Mesh(new THREE.SphereGeometry(0.55, 18, 16), new THREE.MeshStandardMaterial({
-    color: 0x58d7d0, emissive: 0x15a8a2, emissiveIntensity: 0.8, metalness: 0.45, roughness: 0.3, transparent: true, opacity: 0.88,
-  }));
-  pelvis.position.set(0, 0.1, 0);
-  body.add(pelvis);
-
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.54, 22, 18), coreMaterial.clone());
-  head.position.set(0, 2.72, 0.08);
-  body.add(head);
-
-  const faceGrid = new THREE.Mesh(new THREE.TorusKnotGeometry(0.34, 0.08, 120, 16, 2, 3), new THREE.MeshBasicMaterial({
-    color: 0x88e2ff, wireframe: true, transparent: true, opacity: 0.4,
-  }));
-  faceGrid.position.set(0, 2.7, 0.2);
-  faceGrid.scale.set(1.15, 1, 1);
-  body.add(faceGrid);
-
-  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.2, 0.34, 14), new THREE.MeshStandardMaterial({
-    color: 0x86cfff, emissive: 0x295d7e, emissiveIntensity: 0.8, metalness: 0.7, roughness: 0.44,
-  }));
-  neck.position.set(0, 2.12, 0.02);
-  body.add(neck);
-
-  const createLimb = (material, radius, length, color, position, rotation) => {
-    const limb = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius * 1.15, length, 12), material);
-    limb.position.copy(position);
-    limb.rotation.set(rotation.x, rotation.y, rotation.z);
-    return limb;
+  const mesh = (geometry, material, position = null, rotation = null) => {
+    const object = new THREE.Mesh(geometry, material);
+    if (position) object.position.copy(position);
+    if (rotation) object.rotation.set(rotation.x, rotation.y, rotation.z);
+    object.castShadow = object.receiveShadow = true;
+    return object;
+  };
+  const box = (x, y, z, material, position) => mesh(new THREE.BoxGeometry(x, y, z), material, position);
+  const cyl = (r1, r2, h, material, position, rotation) => mesh(new THREE.CylinderGeometry(r1, r2, h, 16), material, position, rotation);
+  const module = (key, label, position, explode, focusRadius = 6.5) => {
+    const group = new THREE.Group();
+    group.name = key;
+    group.position.copy(position);
+    group.userData = { key, label, base: position.clone(), explode: explode.clone(), targetExplode: 0, focusRadius };
+    root.add(group); modules[key] = group;
+    return group;
+  };
+  const boltRing = (parent, radius, z = 0.22) => {
+    for (let i = 0; i < 6; i += 1) {
+      const angle = i / 6 * Math.PI * 2;
+      const bolt = cyl(0.028, 0.028, 0.04, boltMat, new THREE.Vector3(Math.cos(angle) * radius, Math.sin(angle) * radius, z), new THREE.Euler(Math.PI / 2, 0, 0));
+      parent.add(bolt);
+    }
+  };
+  const joint = (radius = 0.2, depth = 0.28) => {
+    const group = new THREE.Group();
+    group.add(cyl(radius, radius, depth, jointMat, new THREE.Vector3(), new THREE.Euler(0, Math.PI / 2, 0)));
+    const ring = mesh(new THREE.TorusGeometry(radius * 0.69, 0.027, 8, 20), accent, new THREE.Vector3(depth / 2 + .005, 0, 0), new THREE.Euler(0, Math.PI / 2, 0));
+    group.add(ring);
+    for (let i = 0; i < 4; i += 1) {
+      const angle = i * Math.PI / 2;
+      group.add(cyl(.026, .026, .045, boltMat, new THREE.Vector3(depth / 2 + .025, Math.cos(angle) * radius * .67, Math.sin(angle) * radius * .67), new THREE.Euler(0, Math.PI / 2, 0)));
+    }
+    return group;
+  };
+  const limbHousing = (length, width, side = 1) => {
+    const group = new THREE.Group();
+    group.add(mesh(new THREE.CapsuleGeometry(width, Math.max(.08, length - width * 2), 6, 14), shellLight));
+    group.add(box(width * 1.33, length * .64, width * .9, carbon, new THREE.Vector3(0, 0, width * .52)));
+    group.add(box(width * .34, length * .56, width * .11, accent, new THREE.Vector3(side * width * .72, 0, width * .58)));
+    group.add(cyl(.045, .045, length * .72, jointMat, new THREE.Vector3(-side * width * .7, 0, width * .42)));
+    group.add(cyl(.066, .066, .07, accent, new THREE.Vector3(-side * width * .7, length * .25, width * .42), new THREE.Euler(Math.PI / 2, 0, 0)));
+    return group;
+  };
+  const armModule = (side) => {
+    const x = side * 1.02;
+    const group = module(side < 0 ? "LEFT_ARM" : "RIGHT_ARM", side < 0 ? "LEFT ARM MODULE" : "RIGHT ARM MODULE", new THREE.Vector3(x, 1.72, 0), new THREE.Vector3(side * .7, .08, 0), 6.8);
+    const shoulder = joint(.27, .34); shoulder.position.set(side * .08, 0, 0); group.add(shoulder);
+    const shoulderCap = mesh(new THREE.SphereGeometry(.34, 16, 12), shell, new THREE.Vector3(side * .11, 0, 0)); shoulderCap.scale.set(1.12, .9, .88); group.add(shoulderCap);
+    const upper = limbHousing(.88, .2, side); upper.position.set(side * .28, -.6, 0); group.add(upper);
+    const elbow = joint(.19, .29); elbow.position.set(side * .27, -1.12, 0); group.add(elbow);
+    const forearm = limbHousing(.78, .18, side); forearm.position.set(side * .32, -1.64, 0); group.add(forearm);
+    const wrist = joint(.12, .2); wrist.position.set(side * .3, -2.1, 0); group.add(wrist);
+    return group;
+  };
+  const handModule = (side) => {
+    const group = module(side < 0 ? "LEFT_HAND" : "RIGHT_HAND", side < 0 ? "LEFT ROBOTIC HAND" : "RIGHT ROBOTIC HAND", new THREE.Vector3(side * 1.35, -.44, .02), new THREE.Vector3(side * 1.05, -.18, .04), 5.5);
+    group.add(box(.34, .42, .2, shellLight, new THREE.Vector3(0, 0, .02)));
+    group.add(box(.22, .28, .1, carbon, new THREE.Vector3(0, -.02, .14)));
+    const fingerX = [-.13, -.045, .045, .13];
+    fingerX.forEach((finger, index) => {
+      const digit = new THREE.Group(); digit.position.set(finger, -.27, .02); group.add(digit);
+      for (let segment = 0; segment < 3; segment += 1) {
+        const length = segment === 0 ? .17 : .125;
+        const phalanx = box(.052, length, .062, shell, new THREE.Vector3(0, -segment * .135, 0));
+        digit.add(phalanx);
+        if (segment < 2) digit.add(cyl(.04, .04, .075, jointMat, new THREE.Vector3(0, -segment * .135 - length / 2, 0), new THREE.Euler(0, 0, Math.PI / 2)));
+      }
+      digit.rotation.z = (index - 1.5) * .08;
+    });
+    const thumb = new THREE.Group(); thumb.position.set(side * .22, -.08, 0); thumb.rotation.z = side * -.68; group.add(thumb);
+    thumb.add(box(.055, .19, .066, shell, new THREE.Vector3(0, -.08, 0))); thumb.add(box(.05, .14, .06, shellLight, new THREE.Vector3(0, -.23, 0)));
+    return group;
+  };
+  const legModule = (side) => {
+    const group = module(side < 0 ? "LEFT_LEG" : "RIGHT_LEG", side < 0 ? "LEFT LEG MODULE" : "RIGHT LEG MODULE", new THREE.Vector3(side * .41, .12, 0), new THREE.Vector3(side * .45, -.15, .02), 7.6);
+    const hip = joint(.21, .3); hip.position.set(0, 0, 0); group.add(hip);
+    const thigh = limbHousing(1.02, .25, side); thigh.position.set(0, -.64, 0); group.add(thigh);
+    const knee = joint(.23, .32); knee.position.set(0, -1.27, .02); group.add(knee);
+    const shin = limbHousing(1.02, .23, -side); shin.position.set(0, -1.91, 0); group.add(shin);
+    const ankle = joint(.14, .25); ankle.position.set(0, -2.48, .02); group.add(ankle);
+    return group;
+  };
+  const footModule = (side) => {
+    const group = module(side < 0 ? "LEFT_FOOT" : "RIGHT_FOOT", side < 0 ? "LEFT MECHANICAL FOOT" : "RIGHT MECHANICAL FOOT", new THREE.Vector3(side * .41, -2.44, .12), new THREE.Vector3(side * .34, -.09, .22), 5.8);
+    group.add(box(.42, .18, .73, shellLight, new THREE.Vector3(0, -.05, .12)));
+    group.add(box(.3, .11, .4, carbon, new THREE.Vector3(0, .04, .27)));
+    group.add(cyl(.065, .065, .44, jointMat, new THREE.Vector3(side * .18, -.05, .08), new THREE.Euler(0, 0, Math.PI / 2)));
+    group.add(box(.44, .06, .79, rubber, new THREE.Vector3(0, -.16, .13)));
+    return group;
   };
 
-  const shoulderMaterial = new THREE.MeshStandardMaterial({ color: 0x90effc, emissive: 0x2d6e99, emissiveIntensity: 0.75, metalness: 0.75, roughness: 0.3 });
-  const armMaterial = new THREE.MeshStandardMaterial({ color: 0xaef1ff, emissive: 0x1d839a, emissiveIntensity: 0.9, metalness: 0.62, roughness: 0.32 });
-  const legMaterial = new THREE.MeshStandardMaterial({ color: 0x93d9ff, emissive: 0x2b6281, emissiveIntensity: 0.7, metalness: 0.7, roughness: 0.35 });
+  const head = module("HEAD", "HEAD MODULE", new THREE.Vector3(0, 3.28, .02), new THREE.Vector3(0, .62, .06), 5.6);
+  const skull = mesh(new THREE.SphereGeometry(.43, 20, 16), shellLight); skull.scale.set(.9, 1.14, .88); head.add(skull);
+  head.add(box(.58, .29, .14, carbon, new THREE.Vector3(0, -.06, .38)));
+  [-.18, .18].forEach((x) => head.add(mesh(new THREE.SphereGeometry(.072, 12, 10), accent, new THREE.Vector3(x, .02, .47))));
+  head.add(box(.18, .09, .06, jointMat, new THREE.Vector3(0, -.22, .46)));
+  [-1, 1].forEach((side) => { const ear = joint(.16, .12); ear.rotation.y = Math.PI / 2; ear.position.set(side * .43, .04, 0); head.add(ear); });
+  boltRing(head, .3, .41);
 
-  const leftShoulder = new THREE.Mesh(new THREE.SphereGeometry(0.18, 12, 10), shoulderMaterial);
-  leftShoulder.position.set(-0.9, 1.7, 0);
-  body.add(leftShoulder);
-  const rightShoulder = leftShoulder.clone();
-  rightShoulder.position.x = 0.9;
-  body.add(rightShoulder);
+  const neck = module("NECK", "NECK & HEAD JOINT", new THREE.Vector3(0, 2.72, 0), new THREE.Vector3(0, .25, 0), 5.4);
+  neck.add(cyl(.17, .2, .35, jointMat, new THREE.Vector3())); neck.add(mesh(new THREE.TorusGeometry(.2, .03, 8, 20), accent, new THREE.Vector3(0, .15, 0)));
+  const torso = module("TORSO", "UPPER TORSO MODULE", new THREE.Vector3(0, 1.88, 0), new THREE.Vector3(0, .12, .08), 7.3);
+  torso.add(box(1.4, .86, .54, shellLight, new THREE.Vector3(0, 0, 0)));
+  torso.add(box(.82, .64, .12, carbon, new THREE.Vector3(0, -.01, .34)));
+  torso.add(box(.12, .52, .07, accent, new THREE.Vector3(0, .02, .42)));
+  [-.57, .57].forEach((x) => { torso.add(box(.2, .72, .57, shell, new THREE.Vector3(x, 0, -.01))); boltRing(torso, .23, .31); });
+  const abdomen = module("ABDOMEN", "CHEST / ABDOMEN MODULE", new THREE.Vector3(0, .98, 0), new THREE.Vector3(0, -.08, .06), 6.7);
+  abdomen.add(cyl(.43, .51, .62, carbon, new THREE.Vector3())); abdomen.add(box(.5, .36, .11, shell, new THREE.Vector3(0, 0, .42))); abdomen.add(cyl(.06, .06, .5, accent, new THREE.Vector3(.31, 0, .3)));
+  const pelvis = module("PELVIS", "HIP / PELVIS MODULE", new THREE.Vector3(0, .28, 0), new THREE.Vector3(0, -.18, .02), 6.5);
+  pelvis.add(box(1.05, .43, .52, shellLight, new THREE.Vector3())); pelvis.add(box(.66, .2, .1, carbon, new THREE.Vector3(0, .05, .32))); [-.4, .4].forEach((x) => { const hip = joint(.2, .32); hip.position.set(x, -.18, 0); pelvis.add(hip); });
 
-  const leftUpperArm = createLimb(armMaterial, 0.12, 0.95, 0x90effc, new THREE.Vector3(-1.22, 0.95, 0), new THREE.Euler(0, 0, 0.22));
-  leftUpperArm.rotation.z = 0.82;
-  body.add(leftUpperArm);
-  const rightUpperArm = leftUpperArm.clone();
-  rightUpperArm.position.x = 1.22; rightUpperArm.rotation.z = -0.82;
-  body.add(rightUpperArm);
+  armModule(-1); armModule(1); handModule(-1); handModule(1); legModule(-1); legModule(1); footModule(-1); footModule(1);
+  const spineCable = new THREE.CatmullRomCurve3([new THREE.Vector3(-.28, 2.3, -.32), new THREE.Vector3(-.4, 1.25, -.45), new THREE.Vector3(-.24, .38, -.34)]);
+  root.add(mesh(new THREE.TubeGeometry(spineCable, 18, .026, 6, false), accent));
+  const plinth = mesh(new THREE.CylinderGeometry(1.55, 1.75, .08, 48), new THREE.MeshStandardMaterial({ color: 0x101b22, metalness:.6, roughness:.34 }), new THREE.Vector3(0, -2.69, .1)); root.add(plinth);
 
-  const leftForearm = createLimb(armMaterial, 0.11, 0.9, 0x90effc, new THREE.Vector3(-1.82, 0.2, 0.1), new THREE.Euler(0, 0, 0.2));
-  leftForearm.rotation.z = 0.95;
-  body.add(leftForearm);
-  const rightForearm = leftForearm.clone();
-  rightForearm.position.x = 1.82; rightForearm.rotation.z = -0.95;
-  body.add(rightForearm);
-
-  const leftHand = new THREE.Mesh(new THREE.SphereGeometry(0.18, 12, 10), new THREE.MeshStandardMaterial({ color: 0xd4f8ff, emissive: 0x2a7bb5, emissiveIntensity: 0.9, metalness: 0.8, roughness: 0.32 }));
-  leftHand.position.set(-2.18, -0.44, 0.12);
-  body.add(leftHand);
-  const rightHand = leftHand.clone(); rightHand.position.x = 2.18; body.add(rightHand);
-
-  const leftThigh = createLimb(legMaterial, 0.16, 1.2, 0x93d9ff, new THREE.Vector3(-0.38, -1.05, 0), new THREE.Euler(0.08, 0, 0.03));
-  body.add(leftThigh);
-  const rightThigh = leftThigh.clone(); rightThigh.position.x = 0.38; body.add(rightThigh);
-
-  const leftShin = createLimb(legMaterial, 0.14, 1.15, 0x93d9ff, new THREE.Vector3(-0.38, -2.18, 0.12), new THREE.Euler(0.12, 0, -0.03));
-  body.add(leftShin);
-  const rightShin = leftShin.clone(); rightShin.position.x = 0.38; body.add(rightShin);
-
-  const leftFoot = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.16, 0.68), new THREE.MeshStandardMaterial({ color: 0x9cf0ff, emissive: 0x16a3b4, emissiveIntensity: 0.9, metalness: 0.5, roughness: 0.22 }));
-  leftFoot.position.set(-0.38, -2.92, 0.18); body.add(leftFoot);
-  const rightFoot = leftFoot.clone(); rightFoot.position.x = 0.38; body.add(rightFoot);
-
-  const bodyTargets = {
-    head: createRobotTarget("head", 0x8df7ff),
-    chest: createRobotTarget("chest", 0x6ea9ff),
-    leftArm: createRobotTarget("leftArm", 0x7be2ff),
-    rightArm: createRobotTarget("rightArm", 0x7be2ff),
-    leftHand: createRobotTarget("leftHand", 0x7be2ff),
-    rightHand: createRobotTarget("rightHand", 0x7be2ff),
-    leftLeg: createRobotTarget("leftLeg", 0x7be2ff),
-    rightLeg: createRobotTarget("rightLeg", 0x7be2ff),
-  };
-
-  bodyTargets.head.position.set(0, 2.72, 0.25); bodyTargets.head.scale.set(1.8, 1.7, 1.7);
-  bodyTargets.chest.position.set(0, 1.2, 0.4); bodyTargets.chest.scale.set(1.7, 1.7, 1.2);
-  bodyTargets.leftArm.position.set(-1.7, 0.35, 0.14); bodyTargets.leftArm.scale.set(1.3, 1.6, 1.2);
-  bodyTargets.rightArm.position.set(1.7, 0.35, 0.14); bodyTargets.rightArm.scale.set(1.3, 1.6, 1.2);
-  bodyTargets.leftHand.position.set(-2.15, -0.44, 0.2); bodyTargets.leftHand.scale.set(1.5, 1.5, 1.5);
-  bodyTargets.rightHand.position.set(2.15, -0.44, 0.2); bodyTargets.rightHand.scale.set(1.5, 1.5, 1.5);
-  bodyTargets.leftLeg.position.set(-0.45, -1.7, 0.18); bodyTargets.leftLeg.scale.set(1.5, 2.2, 1.3);
-  bodyTargets.rightLeg.position.set(0.45, -1.7, 0.18); bodyTargets.rightLeg.scale.set(1.5, 2.2, 1.3);
-
-  Object.values(bodyTargets).forEach((target) => {
-    target.visible = true;
-    root.add(target);
-  });
-
-  const ringGlow = new THREE.Mesh(new THREE.TorusGeometry(1.72, 0.035, 12, 120), new THREE.MeshBasicMaterial({ color: 0x85f1ff, transparent: true, opacity: 0.28 }));
-  ringGlow.rotation.x = Math.PI / 2;
-  ringGlow.position.y = -0.2;
-  root.add(ringGlow);
-
-  const particleCloud = new THREE.Group();
-  const particleGeometry = new THREE.BufferGeometry();
-  const particleCount = 420;
-  const positions = new Float32Array(particleCount * 3);
-  const colors = new Float32Array(particleCount * 3);
-  for (let i = 0; i < particleCount; i += 1) {
-    const i3 = i * 3;
-    positions[i3] = (Math.random() - 0.5) * 5.2;
-    positions[i3 + 1] = (Math.random() - 0.5) * 6.4;
-    positions[i3 + 2] = (Math.random() - 0.5) * 3.3;
-    const color = new THREE.Color(i % 2 === 0 ? 0x95f1ff : 0x7fa8ff);
-    colors[i3] = color.r;
-    colors[i3 + 1] = color.g;
-    colors[i3 + 2] = color.b;
-  }
-  particleGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  particleGeometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-  const particleMaterial = new THREE.PointsMaterial({ size: 0.03, vertexColors: true, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending });
-  const points = new THREE.Points(particleGeometry, particleMaterial);
-  particleCloud.add(points);
-  root.add(particleCloud);
-
-  root.userData = {
-    body,
-    head,
-    chestPlate,
-    leftUpperArm,
-    rightUpperArm,
-    leftForearm,
-    rightForearm,
-    leftHand,
-    rightHand,
-    leftThigh,
-    rightThigh,
-    leftShin,
-    rightShin,
-    ringGlow,
-    particleCloud,
-    coreMaterial,
-    targetMeshes: bodyTargets,
-  };
-
-  root.position.set(0, 0.1, 0);
-  root.scale.setScalar(1.14);
+  Object.values(modules).forEach((part) => part.traverse((child) => {
+    if (child.isMesh) { child.userData.partKey = part.userData.key; pickables.push(child); }
+  }));
+  root.userData = { modules, pickables };
+  root.scale.setScalar(1.06);
   return root;
 }
 
 function initializeThree() {
   const scene = new THREE.Scene();
   scene.fog = new THREE.FogExp2(0x0a0f18, 0.05);
-  const camera = new THREE.PerspectiveCamera(36, 1, 0.1, 100);
-  camera.position.set(0, 0.6, 8.4);
+  const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 100);
+  camera.position.set(0, 0.35, 12.4);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.setSize(cameraViewport.clientWidth, cameraViewport.clientHeight, false);
+  renderer.setSize(sceneViewport.clientWidth, sceneViewport.clientHeight, false);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.25;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.domElement.setAttribute("aria-label", "Interactive Three.js robot scene");
-  cameraViewport.prepend(renderer.domElement);
+  sceneViewport.prepend(renderer.domElement);
 
   const hemisphere = new THREE.HemisphereLight(0xbfe8ff, 0x10161d, 1.65);
   scene.add(hemisphere);
@@ -556,12 +492,12 @@ function initializeThree() {
   keyLight.position.set(-3, 5, 5);
   scene.add(keyLight);
 
-  const cyanGlow = new THREE.PointLight(0x65e4ff, 22, 12, 2);
+  const cyanGlow = new THREE.PointLight(0x65e4ff, 18, 12, 2);
   cyanGlow.position.set(2.5, 1.4, 3.5);
   scene.add(cyanGlow);
 
   const grid = new THREE.GridHelper(14, 30, 0x3a8290, 0x2f3d4b);
-  grid.position.y = -2.2;
+  grid.position.y = -2.75;
   grid.material.transparent = true;
   grid.material.opacity = 0.28;
   scene.add(grid);
@@ -573,16 +509,22 @@ function initializeThree() {
   state.camera = camera;
   state.renderer = renderer;
   state.robot = robot;
-  state.robotTargetMeshes = robot.userData.targetMeshes;
-  state.robot.userData.coreMaterial = robot.userData.coreMaterial;
+  state.robotModules = robot.userData.modules;
+  state.robotPickables = robot.userData.pickables;
 
   resizeThree();
+  ui.sceneLoading.hidden = true;
+  ui.interactionState.textContent = "MOUSE / TOUCH READY";
+  if (!state.animationStarted) {
+    state.animationStarted = true;
+    requestAnimationFrame(animate);
+  }
 }
 
 function resizeThree() {
   if (!state.renderer || !state.camera) return;
-  const width = cameraViewport.clientWidth;
-  const height = cameraViewport.clientHeight;
+  const width = sceneViewport.clientWidth;
+  const height = sceneViewport.clientHeight;
   if (!width || !height) return;
   state.renderer.setSize(width, height, false);
   state.camera.aspect = width / height;
@@ -592,64 +534,16 @@ function resizeThree() {
 
 function animateRobot(now) {
   if (!state.robot) return;
-  const t = now * 0.001;
-  const pulse = 1 + Math.sin(t * 1.8) * 0.05 + state.tapPulse * 0.16;
-  state.robot.scale.setScalar(pulse);
-  state.robot.rotation.y += 0.004;
-  state.robot.rotation.x = Math.sin(t * 0.7) * 0.06;
-  state.robot.position.y += Math.sin(t * 1.7) * 0.004;
-
-  const leftArm = state.robot.userData.leftUpperArm;
-  const rightArm = state.robot.userData.rightUpperArm;
-  const leftForearm = state.robot.userData.leftForearm;
-  const rightForearm = state.robot.userData.rightForearm;
-  const leftShin = state.robot.userData.leftShin;
-  const rightShin = state.robot.userData.rightShin;
-  const head = state.robot.userData.head;
-  const ringGlow = state.robot.userData.ringGlow;
-  const particleCloud = state.robot.userData.particleCloud;
-
-  leftArm.rotation.z = 0.82 + Math.sin(t * 1.2) * 0.18;
-  rightArm.rotation.z = -0.82 - Math.sin(t * 1.2 + 0.8) * 0.18;
-  leftForearm.rotation.z = 0.95 + Math.sin(t * 1.2 + 1.2) * 0.12;
-  rightForearm.rotation.z = -0.95 - Math.sin(t * 1.2 + 1.4) * 0.12;
-  leftShin.rotation.x = 0.12 + Math.sin(t * 1.3 + 0.7) * 0.09;
-  rightShin.rotation.x = 0.12 + Math.sin(t * 1.3 + 1.0) * 0.09;
-  head.rotation.y = Math.sin(t * 1.1) * 0.25;
-  head.rotation.z = Math.sin(t * 1.5) * 0.13;
-  ringGlow.rotation.z += 0.008;
-  ringGlow.material.opacity = 0.2 + Math.sin(t * 2.8) * 0.08;
-
-  const positions = particleCloud.children[0].geometry.attributes.position.array;
-  for (let i = 0; i < positions.length; i += 3) {
-    positions[i] += Math.sin(t * 0.5 + i) * 0.0009;
-    positions[i + 1] += Math.cos(t * 0.6 + i) * 0.0009;
-  }
-  particleCloud.children[0].geometry.attributes.position.needsUpdate = true;
-
-  if (state.tapPulse > 0) {
-    state.tapPulse *= 0.94;
-    if (state.tapPulse < 0.01) state.tapPulse = 0;
-  }
-
-  if (state.confirmPulse > 0) {
-    state.confirmPulse *= 0.94;
-    if (state.confirmPulse < 0.01) {
-      state.confirmPulse = 0;
-      ui.confirmState.textContent = "AWAITING INPUT";
-    }
-  }
-
-  const robotCore = state.robot.userData.coreMaterial;
-  robotCore.emissiveIntensity = 1.2 + state.tapPulse * 1.8 + Math.sin(t * 2.4) * 0.1;
-  if (state.confirmPulse > 0) {
-    robotCore.emissiveIntensity = 2.5 + state.confirmPulse * 4;
-  }
+  Object.values(state.robotModules).forEach((part) => {
+    const { base, explode, targetExplode } = part.userData;
+    const desired = base.clone().addScaledVector(explode, targetExplode);
+    part.position.lerp(desired, 0.095);
+  });
 }
 
 function animate() {
-  if (!state.active || !state.renderer || !state.scene || !state.camera) return;
   requestAnimationFrame(animate);
+  if (!state.renderer || !state.scene || !state.camera) return;
   const now = performance.now();
   const elapsed = Math.min((now - state.lastFrameTime) / 1000, 0.05);
   state.lastFrameTime = now;
@@ -662,11 +556,25 @@ function animate() {
   }
 
   animateRobot(now);
-  state.camera.position.x += (0.2 - state.camera.position.x) * 0.02;
-  state.camera.position.y += (0.7 - state.camera.position.y) * 0.02;
-  state.camera.lookAt(0, 0.3, 0);
+  state.cameraFocus.lerp(state.cameraFocusTarget, 0.08);
+  state.cameraRadius += (state.cameraRadiusTarget - state.cameraRadius) * 0.075;
+  state.cameraPitch = THREE.MathUtils.clamp(state.cameraPitch, -0.55, 0.5);
+  const cosPitch = Math.cos(state.cameraPitch);
+  state.camera.position.set(
+    state.cameraFocus.x + Math.sin(state.cameraYaw) * cosPitch * state.cameraRadius,
+    state.cameraFocus.y + Math.sin(state.cameraPitch) * state.cameraRadius,
+    state.cameraFocus.z + Math.cos(state.cameraYaw) * cosPitch * state.cameraRadius,
+  );
+  state.camera.lookAt(state.cameraFocus);
+  if (state.selectedModule) {
+    const selected = state.robotModules[state.selectedModule];
+    const marker = selected.getWorldPosition(new THREE.Vector3()).project(state.camera);
+    const width = sceneViewport.clientWidth; const height = sceneViewport.clientHeight;
+    ui.objectHud.style.left = `${(marker.x * .5 + .5) * width + 24}px`;
+    ui.objectHud.style.top = `${(-marker.y * .5 + .5) * height - 16}px`;
+  }
   if (state.renderer) state.renderer.render(state.scene, state.camera);
-  ui.sceneCoords.textContent = `X ${state.robot.position.x.toFixed(2)}  Y ${state.robot.position.y.toFixed(2)}`;
+  ui.sceneCoords.textContent = state.selectedModule ? `FOCUS ${state.selectedModule}` : "READY / SELECT MODULE";
 }
 
 async function initializeHandTracking() {
@@ -758,10 +666,6 @@ async function startExperience() {
     cameraViewport.classList.add("is-live");
     await video.play();
 
-    if (!state.renderer) {
-      initializeThree();
-    }
-
     if (!state.handLandmarkerReady) {
       await initializeHandTracking();
     }
@@ -776,7 +680,6 @@ async function startExperience() {
     startScreen.classList.add("dismissed");
     updateCameraToggle();
     requestAnimationFrame(processVideoFrame);
-    requestAnimationFrame(animate);
   } catch (error) {
     console.error("Experience initialization failed:", error);
     if (state.stream) {
@@ -836,9 +739,47 @@ cameraToggleButton.addEventListener("click", () => {
 startButton.addEventListener("click", startExperience);
 window.addEventListener("resize", resizeThree);
 
+document.querySelector("#exploded-view").addEventListener("click", explodeRobot);
+document.querySelector("#reset-robot").addEventListener("click", resetRobot);
+
+function pickRobotAt(clientX, clientY) {
+  if (!state.camera || !state.robotPickables.length) return;
+  const bounds = sceneViewport.getBoundingClientRect();
+  const point = new THREE.Vector2(((clientX - bounds.left) / bounds.width) * 2 - 1, -((clientY - bounds.top) / bounds.height) * 2 + 1);
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(point, state.camera);
+  const hit = raycaster.intersectObjects(state.robotPickables, false)[0];
+  if (hit) selectModule(hit.object.userData.partKey, true);
+}
+
+sceneViewport.addEventListener("pointerdown", (event) => {
+  if (event.target.closest("button")) return;
+  state.pointerDown = true; state.didDrag = false; state.pointerX = event.clientX; state.pointerY = event.clientY;
+  sceneViewport.setPointerCapture?.(event.pointerId);
+});
+sceneViewport.addEventListener("pointermove", (event) => {
+  if (!state.pointerDown) return;
+  const dx = event.clientX - state.pointerX; const dy = event.clientY - state.pointerY;
+  if (Math.abs(dx) + Math.abs(dy) > 2) state.didDrag = true;
+  state.cameraYaw -= dx * .009;
+  state.cameraPitch += dy * .006;
+  state.pointerX = event.clientX; state.pointerY = event.clientY;
+});
+sceneViewport.addEventListener("pointerup", (event) => {
+  if (state.pointerDown && !state.didDrag) pickRobotAt(event.clientX, event.clientY);
+  state.pointerDown = false;
+});
+sceneViewport.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  state.cameraRadiusTarget = THREE.MathUtils.clamp(state.cameraRadiusTarget + event.deltaY * .009, 4.3, 15);
+}, { passive: false });
+
 updateCameraToggle();
 sizeLandmarkCanvas();
 ui.handStatus.textContent = "NOT DETECTED";
 ui.cameraTag.textContent = "STANDBY";
 ui.cameraState.textContent = "INPUT STANDBY";
 ui.footerStatus.textContent = "NOT INITIALIZED";
+initializeThree();
+// The spatial canvas is useful before camera permission is granted; camera can be enabled from its panel.
+startScreen.classList.add("dismissed");

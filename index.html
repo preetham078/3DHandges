@@ -68,7 +68,11 @@
             <div class="scene-backdrop-grid"></div>
             <div class="scene-label scene-label-top">ARTIFACT / 01 <span>◆</span></div>
             <div class="scene-label scene-label-bottom">3D OBJECT <span class="scene-coords" id="scene-coords">X 0.00 &nbsp; Y 0.00</span></div>
-            <div class="object-hud" id="object-hud"><span class="hud-crosshair">+</span><span>OBJECT SELECTED</span></div>
+            <div class="scene-actions" aria-label="Robot controls">
+              <button id="exploded-view" type="button">EXPLODED VIEW</button>
+              <button id="reset-robot" type="button">RESET ROBOT</button>
+            </div>
+            <div class="object-hud" id="object-hud"><span class="hud-crosshair">+</span><span id="object-hud-label">HEAD MODULE</span><i></i></div>
             <div class="scene-loading" id="scene-loading"><span class="loading-ring"></span><span>INITIALIZING SPATIAL ENGINE</span></div>
             <div class="scene-error" id="scene-error" role="alert" hidden></div>
           </div>
